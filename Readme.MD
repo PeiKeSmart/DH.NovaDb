@@ -1,3 +1,3 @@
-﻿# DH.Grpc - Grpc扩展类
+﻿# DH.NNovaDb - NovaDb扩展类
 
-DH框架Grpc扩展类
+DH框架NovaDb扩展类
