@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFrameworks>net45;net6.0;net8.0;net10.0</TargetFrameworks>
+    <AssemblyName>DH.NNovaServer</AssemblyName>
+    <AssemblyTitle>登灏NNova数据库</AssemblyTitle>
+    <Description>流星数据库</Description>
+    <Company>湖北登灏科技有限公司</Company>
+    <Copyright>©2020-2026 湖北登灏科技有限公司</Copyright>
+    <VersionPrefix>4.25</VersionPrefix>
+    <VersionSuffix>$([System.DateTime]::Now.ToString(`yyyy.MMdd`))</VersionSuffix>
+    <Version>$(VersionPrefix).$(VersionSuffix)</Version>
+    <FileVersion>$(Version)</FileVersion>
+    <AssemblyVersion>$(VersionPrefix).*</AssemblyVersion>
+    <Deterministic>false</Deterministic>
+    <OutputPath>..\Bin\Server</OutputPath>
+    <AppendTargetFrameworkToOutputPath>true</AppendTargetFrameworkToOutputPath>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="DH.NStardust" Version="4.24.2026.707-beta1531" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DH.NNovaDb\DH.NNovaDb.csproj" />
+  </ItemGroup>
+
+</Project>

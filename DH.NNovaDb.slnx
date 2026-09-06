@@ -9,4 +9,6 @@
   </Folder>
   <Project Path="Benchmark/Benchmark.csproj" />
   <Project Path="DH.NNovaDb/DH.NNovaDb.csproj" />
+  <Project Path="DH.NNovaServer/DH.NNovaServer.csproj" />
+  <Project Path="Test/Test.csproj" />
 </Solution>
