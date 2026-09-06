@@ -7,5 +7,6 @@
     <File Path="NuGet.config" />
     <File Path="Readme.MD" />
   </Folder>
+  <Project Path="Benchmark/Benchmark.csproj" />
   <Project Path="DH.NNovaDb/DH.NNovaDb.csproj" />
 </Solution>
