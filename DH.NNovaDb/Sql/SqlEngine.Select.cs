@@ -1,0 +1,725 @@
+﻿using NewLife.NovaDb.Core;
+using NewLife.NovaDb.Engine;
+
+namespace NewLife.NovaDb.Sql;
+
+partial class SqlEngine
+{
+    #region SELECT 执行
+
+    private SqlResult ExecuteSelect(SelectStatement stmt, Dictionary<String, Object?>? parameters)
+    {
+        // 无表的 SELECT（如 SELECT 1）
+        if (stmt.TableName == null)
+        {
+            return ExecuteSelectNoTable(stmt, parameters);
+        }
+
+        // 系统表查询
+        if (stmt.TableName.StartsWith("_sys.", StringComparison.OrdinalIgnoreCase))
+        {
+            return ExecuteSystemTableQuery(stmt, parameters);
+        }
+
+        // MySQL 兼容的 information_schema 视图（XCode 元数据访问入口）
+        if (stmt.TableName.StartsWith("information_schema.", StringComparison.OrdinalIgnoreCase))
+        {
+            return ExecuteInformationSchemaQuery(stmt, parameters);
+        }
+
+        // JOIN 查询
+        if (stmt.HasJoin)
+        {
+            return ExecuteSelectWithJoin(stmt, parameters);
+        }
+
+        var table = GetTable(stmt.TableName);
+        var schema = GetSchema(stmt.TableName);
+
+        using var tx = _txManager.BeginTransaction();
+
+        // 1. 获取所有行
+        var rows = table.GetAll(tx);
+
+        // 2. WHERE 过滤
+        if (stmt.Where != null)
+        {
+            rows = rows.Where(row => EvaluateCondition(stmt.Where, row, schema, parameters)).ToList();
+        }
+
+        // 3. GROUP BY
+        if (stmt.GroupBy != null && stmt.GroupBy.Count > 0)
+        {
+            return ExecuteGroupBy(stmt, rows, schema, parameters);
+        }
+
+        // 4. 检查是否有聚合函数（无 GROUP BY）
+        if (HasAggregateFunction(stmt))
+        {
+            return ExecuteAggregate(stmt, rows, schema, parameters);
+        }
+
+        // 5. ORDER BY
+        if (stmt.OrderBy != null)
+        {
+            rows = ApplyOrderBy(rows, stmt.OrderBy, schema);
+        }
+
+        // 6. OFFSET / LIMIT
+        if (stmt.OffsetValue.HasValue)
+        {
+            rows = rows.Skip(stmt.OffsetValue.Value).ToList();
+        }
+        if (stmt.Limit.HasValue)
+        {
+            rows = rows.Take(stmt.Limit.Value).ToList();
+        }
+
+        // 7. 投影
+        return BuildSelectResult(stmt, rows, schema, parameters);
+    }
+
+    #region 系统表查询
+
+    /// <summary>系统表前缀</summary>
+    private const String SystemTablePrefix = "_sys.";
+
+    private SqlResult ExecuteSystemTableQuery(SelectStatement stmt, Dictionary<String, Object?>? parameters)
+    {
+        var sysTableName = stmt.TableName!.Substring(SystemTablePrefix.Length).ToLower();
+
+        // 构建虚拟 Schema 和行数据
+        var (schema, rows) = sysTableName switch
+        {
+            "tables" => BuildSysTablesData(),
+            "columns" => BuildSysColumnsData(),
+            "indexes" => BuildSysIndexesData(),
+            "metrics" => BuildSysMetricsData(),
+            "version" => BuildSysVersionData(),
+            "binlog" => BuildSysBinlogData(),
+            _ => throw new NovaException(ErrorCode.TableNotFound, $"System table '{stmt.TableName}' not found")
+        };
+
+        // WHERE 过滤
+        if (stmt.Where != null)
+        {
+            rows = rows.Where(row => EvaluateCondition(stmt.Where, row, schema, parameters)).ToList();
+        }
+
+        // ORDER BY
+        if (stmt.OrderBy != null)
+        {
+            rows = ApplyOrderBy(rows, stmt.OrderBy, schema);
+        }
+
+        // OFFSET / LIMIT
+        if (stmt.OffsetValue.HasValue)
+        {
+            rows = rows.Skip(stmt.OffsetValue.Value).ToList();
+        }
+        if (stmt.Limit.HasValue)
+        {
+            rows = rows.Take(stmt.Limit.Value).ToList();
+        }
+
+        // 投影
+        return BuildSelectResult(stmt, rows, schema, parameters);
+    }
+
+    private (TableSchema Schema, List<Object?[]> Rows) BuildSysTablesData()
+    {
+        var schema = new TableSchema("_sys.tables");
+        // NovaDb 原生字段
+        schema.AddColumn(new ColumnDefinition("name", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("column_count", DataType.Int32, false));
+        schema.AddColumn(new ColumnDefinition("primary_key", DataType.String, true));
+        schema.AddColumn(new ColumnDefinition("row_count", DataType.Int32, false));
+        // MySQL information_schema.tables 兼容字段（XCode 等会使用）
+        schema.AddColumn(new ColumnDefinition("table_schema", DataType.String, true));
+        schema.AddColumn(new ColumnDefinition("table_name", DataType.String, true));
+        schema.AddColumn(new ColumnDefinition("table_rows", DataType.Int64, true));
+        schema.AddColumn(new ColumnDefinition("table_comment", DataType.String, true));
+
+        var dbName = GetCurrentDatabaseName();
+        var rows = new List<Object?[]>();
+        using var rl1 = _metaLock.AcquireRead();
+        {
+            foreach (var kvp in _schemas)
+            {
+                var tableName = kvp.Key;
+                var tableSchema = kvp.Value;
+                var pkCol = tableSchema.GetPrimaryKeyColumn();
+
+                var rowCount = 0;
+                if (_tables.TryGetValue(tableName, out var table))
+                {
+                    using var tx = _txManager.BeginTransaction();
+                    rowCount = table.GetAll(tx).Count;
+                    tx.Commit();
+                }
+
+                rows.Add(
+                [
+                    tableName,
+                    tableSchema.Columns.Count,
+                    pkCol?.Name,
+                    rowCount,
+                    dbName,
+                    tableName,
+                    (Int64)rowCount,
+                    tableSchema.Comment
+                ]);
+            }
+        }
+
+        return (schema, rows);
+    }
+
+    private (TableSchema Schema, List<Object?[]> Rows) BuildSysColumnsData()
+    {
+        var schema = new TableSchema("_sys.columns");
+        schema.AddColumn(new ColumnDefinition("table_name", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("column_name", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("data_type", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("is_nullable", DataType.Boolean, false));
+        schema.AddColumn(new ColumnDefinition("is_primary_key", DataType.Boolean, false));
+        schema.AddColumn(new ColumnDefinition("ordinal_position", DataType.Int32, false));
+
+        var rows = new List<Object?[]>();
+        using var rl2 = _metaLock.AcquireRead();
+        {
+            foreach (var kvp in _schemas)
+            {
+                var tableName = kvp.Key;
+                var tableSchema = kvp.Value;
+
+                foreach (var col in tableSchema.Columns)
+                {
+                    rows.Add(
+                    [
+                        tableName, col.Name, col.DataType.ToString(), col.Nullable, col.IsPrimaryKey, col.Ordinal
+                    ]);
+                }
+            }
+        }
+
+        return (schema, rows);
+    }
+
+    private (TableSchema Schema, List<Object?[]> Rows) BuildSysIndexesData()
+    {
+        var schema = new TableSchema("_sys.indexes");
+        schema.AddColumn(new ColumnDefinition("table_name", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("index_name", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("is_unique", DataType.Boolean, false));
+        schema.AddColumn(new ColumnDefinition("columns", DataType.String, false));
+
+        var rows = new List<Object?[]>();
+        using var rl3 = _metaLock.AcquireRead();
+        {
+            foreach (var kvp in _schemas)
+            {
+                var tableName = kvp.Key;
+                var tableSchema = kvp.Value;
+                var pkCol = tableSchema.GetPrimaryKeyColumn();
+
+                // 主键索引始终存在
+                if (pkCol != null)
+                {
+                    rows.Add(
+                    [
+                        tableName, $"pk_{tableName}", true, pkCol.Name
+                    ]);
+                }
+
+                // 二级索引
+                foreach (var idx in tableSchema.Indexes)
+                {
+                    rows.Add(
+                    [
+                        tableName, idx.IndexName, idx.IsUnique, String.Join(",", idx.Columns)
+                    ]);
+                }
+            }
+        }
+
+        return (schema, rows);
+    }
+
+    private (TableSchema Schema, List<Object?[]> Rows) BuildSysMetricsData()
+    {
+        var schema = new TableSchema("_sys.metrics");
+        schema.AddColumn(new ColumnDefinition("metric", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("value", DataType.String, false));
+
+        // 更新表计数
+        using (var rl4 = _metaLock.AcquireRead())
+        {
+            Metrics.TableCount = _schemas.Count;
+        }
+
+        var rows = new List<Object?[]>
+        {
+            new Object?[] { "table_count", Metrics.TableCount.ToString() },
+            new Object?[] { "total_rows", Metrics.TotalRows.ToString() },
+            new Object?[] { "execute_count", Metrics.ExecuteCount.ToString() },
+            new Object?[] { "query_count", Metrics.QueryCount.ToString() },
+            new Object?[] { "insert_count", Metrics.InsertCount.ToString() },
+            new Object?[] { "update_count", Metrics.UpdateCount.ToString() },
+            new Object?[] { "delete_count", Metrics.DeleteCount.ToString() },
+            new Object?[] { "ddl_count", Metrics.DdlCount.ToString() },
+            new Object?[] { "commit_count", Metrics.CommitCount.ToString() },
+            new Object?[] { "rollback_count", Metrics.RollbackCount.ToString() },
+            new Object?[] { "start_time", Metrics.StartTime.ToString("o") },
+            new Object?[] { "uptime_seconds", Metrics.Uptime.TotalSeconds.ToString("F0") }
+        };
+
+        return (schema, rows);
+    }
+
+    private (TableSchema Schema, List<Object?[]> Rows) BuildSysVersionData()
+    {
+        var schema = new TableSchema("_sys.version");
+        schema.AddColumn(new ColumnDefinition("version", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("platform", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("start_time", DataType.String, false));
+
+        var version = NovaDbTool.GetVersion();
+        var platform = Environment.Version.ToString();
+        var startTime = Metrics.StartTime.ToString("o");
+
+        var rows = new List<Object?[]>
+        {
+            new Object?[] { version, platform, startTime }
+        };
+
+        return (schema, rows);
+    }
+
+    private (TableSchema Schema, List<Object?[]> Rows) BuildSysBinlogData()
+    {
+        var schema = new TableSchema("_sys.binlog");
+        schema.AddColumn(new ColumnDefinition("file_name", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("file_size", DataType.Int64, false));
+        schema.AddColumn(new ColumnDefinition("current", DataType.Boolean, false));
+
+        var rows = new List<Object?[]>();
+
+        if (Binlog != null)
+        {
+            foreach (var (fileName, size) in Binlog.ListFiles())
+            {
+                var isCurrent = fileName.EndsWith($".{Binlog.FileIndex:D6}");
+                rows.Add([fileName, size, isCurrent]);
+            }
+        }
+
+        return (schema, rows);
+    }
+
+    #endregion
+
+    #region information_schema 视图
+
+    /// <summary>information_schema 前缀</summary>
+    private const String InformationSchemaPrefix = "information_schema.";
+
+    /// <summary>执行 MySQL 兼容的 information_schema 视图查询</summary>
+    /// <remarks>XCode 等元数据访问会先 SHOW TABLE STATUS，再查 information_schema.columns / statistics</remarks>
+    private SqlResult ExecuteInformationSchemaQuery(SelectStatement stmt, Dictionary<String, Object?>? parameters)
+    {
+        var name = stmt.TableName!.Substring(InformationSchemaPrefix.Length).ToLower();
+
+        var (schema, rows) = name switch
+        {
+            "columns" => BuildInformationSchemaColumns(),
+            "statistics" => BuildInformationSchemaStatistics(),
+            "tables" => BuildInformationSchemaTables(),
+            _ => throw new NovaException(ErrorCode.TableNotFound, $"System view '{stmt.TableName}' not found")
+        };
+
+        if (stmt.Where != null)
+            rows = rows.Where(row => EvaluateCondition(stmt.Where, row, schema, parameters)).ToList();
+
+        if (stmt.OrderBy != null)
+            rows = ApplyOrderBy(rows, stmt.OrderBy, schema);
+
+        if (stmt.OffsetValue.HasValue)
+            rows = rows.Skip(stmt.OffsetValue.Value).ToList();
+        if (stmt.Limit.HasValue)
+            rows = rows.Take(stmt.Limit.Value).ToList();
+
+        return BuildSelectResult(stmt, rows, schema, parameters);
+    }
+
+    /// <summary>当前数据库名（取自数据目录名称）</summary>
+    private String GetCurrentDatabaseName()
+        => Path.GetFileName(_dbPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+
+    private (TableSchema Schema, List<Object?[]> Rows) BuildInformationSchemaTables()
+    {
+        var schema = new TableSchema("information_schema.tables");
+        schema.AddColumn(new ColumnDefinition("TABLE_SCHEMA", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("TABLE_NAME", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("TABLE_TYPE", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("ENGINE", DataType.String, true));
+        schema.AddColumn(new ColumnDefinition("TABLE_ROWS", DataType.Int64, true));
+        schema.AddColumn(new ColumnDefinition("TABLE_COMMENT", DataType.String, true));
+
+        var dbName = GetCurrentDatabaseName();
+        var rows = new List<Object?[]>();
+        using var _ = _metaLock.AcquireRead();
+        foreach (var ts in _schemas.Values)
+        {
+            var stats = GetTableStatsNoLock(ts.TableName);
+            rows.Add([dbName, ts.TableName, "BASE TABLE", ts.EngineName, (Object?)(stats?.TableRows ?? 0L), ts.Comment ?? String.Empty]);
+        }
+        return (schema, rows);
+    }
+
+    private (TableSchema Schema, List<Object?[]> Rows) BuildInformationSchemaColumns()
+    {
+        var schema = new TableSchema("information_schema.columns");
+        schema.AddColumn(new ColumnDefinition("TABLE_SCHEMA", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("TABLE_NAME", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("COLUMN_NAME", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("ORDINAL_POSITION", DataType.Int32, false));
+        schema.AddColumn(new ColumnDefinition("COLUMN_DEFAULT", DataType.String, true));
+        schema.AddColumn(new ColumnDefinition("IS_NULLABLE", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("DATA_TYPE", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("CHARACTER_MAXIMUM_LENGTH", DataType.Int64, true));
+        schema.AddColumn(new ColumnDefinition("NUMERIC_PRECISION", DataType.Int32, true));
+        schema.AddColumn(new ColumnDefinition("NUMERIC_SCALE", DataType.Int32, true));
+        schema.AddColumn(new ColumnDefinition("COLUMN_TYPE", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("COLUMN_KEY", DataType.String, true));
+        schema.AddColumn(new ColumnDefinition("EXTRA", DataType.String, true));
+        schema.AddColumn(new ColumnDefinition("COLUMN_COMMENT", DataType.String, true));
+
+        var dbName = GetCurrentDatabaseName();
+        var rows = new List<Object?[]>();
+        using var _ = _metaLock.AcquireRead();
+        foreach (var ts in _schemas.Values)
+        {
+            for (var i = 0; i < ts.Columns.Count; i++)
+            {
+                var col = ts.Columns[i];
+                var (dataType, columnType, precision, scale, maxLength) = MapToMySqlType(col.DataType);
+                rows.Add(
+                [
+                    dbName,                                                 // TABLE_SCHEMA
+                    ts.TableName,                                           // TABLE_NAME
+                    col.Name,                                               // COLUMN_NAME
+                    i + 1,                                                  // ORDINAL_POSITION
+                    (Object?)DBNull.Value,                                  // COLUMN_DEFAULT
+                    col.Nullable ? "YES" : "NO",                            // IS_NULLABLE
+                    dataType,                                               // DATA_TYPE
+                    (Object?)(maxLength.HasValue ? maxLength.Value : DBNull.Value), // CHARACTER_MAXIMUM_LENGTH
+                    (Object?)(precision.HasValue ? precision.Value : DBNull.Value), // NUMERIC_PRECISION
+                    (Object?)(scale.HasValue ? scale.Value : DBNull.Value),         // NUMERIC_SCALE
+                    columnType,                                             // COLUMN_TYPE
+                    col.IsPrimaryKey ? "PRI" : String.Empty,                // COLUMN_KEY
+                    String.Empty,                                           // EXTRA
+                    col.Comment ?? String.Empty                             // COLUMN_COMMENT
+                ]);
+            }
+        }
+        return (schema, rows);
+    }
+
+    private (TableSchema Schema, List<Object?[]> Rows) BuildInformationSchemaStatistics()
+    {
+        var schema = new TableSchema("information_schema.statistics");
+        schema.AddColumn(new ColumnDefinition("TABLE_SCHEMA", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("TABLE_NAME", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("NON_UNIQUE", DataType.Int32, false));
+        schema.AddColumn(new ColumnDefinition("INDEX_NAME", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("SEQ_IN_INDEX", DataType.Int32, false));
+        schema.AddColumn(new ColumnDefinition("COLUMN_NAME", DataType.String, false));
+        schema.AddColumn(new ColumnDefinition("COLLATION", DataType.String, true));
+        schema.AddColumn(new ColumnDefinition("INDEX_TYPE", DataType.String, true));
+
+        var dbName = GetCurrentDatabaseName();
+        var rows = new List<Object?[]>();
+        using var _ = _metaLock.AcquireRead();
+        foreach (var ts in _schemas.Values)
+        {
+            // 主键
+            var pk = ts.GetPrimaryKeyColumn();
+            if (pk != null)
+                rows.Add([dbName, ts.TableName, 0, "PRIMARY", 1, pk.Name, "A", "BTREE"]);
+
+            // 二级索引
+            foreach (var idx in ts.Indexes)
+            {
+                for (var i = 0; i < idx.Columns.Count; i++)
+                {
+                    rows.Add([dbName, ts.TableName, idx.IsUnique ? 0 : 1, idx.IndexName, i + 1, idx.Columns[i], "A", "BTREE"]);
+                }
+            }
+        }
+        return (schema, rows);
+    }
+
+    /// <summary>将 NovaDb 数据类型映射为 MySQL 兼容的元数据描述</summary>
+    private static (String DataType, String ColumnType, Int32? Precision, Int32? Scale, Int64? MaxLength) MapToMySqlType(DataType type)
+    {
+        return type switch
+        {
+            DataType.Boolean => ("tinyint", "tinyint(1)", 3, 0, null),
+            DataType.Int32 => ("int", "int(11)", 10, 0, null),
+            DataType.Int64 => ("bigint", "bigint(20)", 19, 0, null),
+            DataType.Double => ("double", "double", 22, null, null),
+            DataType.Decimal => ("decimal", "decimal(18,4)", 18, 4, null),
+            DataType.String => ("varchar", "varchar(255)", null, null, 255L),
+            DataType.Binary => ("blob", "blob", null, null, 65535L),
+            DataType.DateTime => ("datetime", "datetime", null, null, null),
+            DataType.GeoPoint => ("varchar", "varchar(64)", null, null, 64L),
+            DataType.Vector => ("longtext", "longtext", null, null, null),
+            _ => ("varchar", "varchar(255)", null, null, 255L)
+        };
+    }
+
+    #endregion
+
+    private SqlResult ExecuteSelectNoTable(SelectStatement stmt, Dictionary<String, Object?>? parameters)
+    {
+        var result = new SqlResult();
+        var colNames = new List<String>();
+        var values = new List<Object?>();
+
+        for (var i = 0; i < stmt.Columns.Count; i++)
+        {
+            var col = stmt.Columns[i];
+            var val = EvaluateExpression(col.Expression, null, null, parameters);
+            colNames.Add(col.Alias ?? $"col{i}");
+            values.Add(val);
+        }
+
+        result.ColumnNames = colNames.ToArray();
+        result.Rows.Add(values.ToArray());
+        return result;
+    }
+
+    private SqlResult ExecuteSelectWithJoin(SelectStatement stmt, Dictionary<String, Object?>? parameters)
+    {
+        using var tx = _txManager.BeginTransaction();
+
+        // 构建合并 Schema：左表 + 所有 JOIN 右表
+        var leftSchema = GetSchema(stmt.TableName!);
+        var leftTable = GetTable(stmt.TableName!);
+        var leftAlias = stmt.TableAlias ?? stmt.TableName!;
+
+        var leftRows = leftTable.GetAll(tx);
+
+        // 表别名 → Schema 的映射
+        var aliasSchemas = new Dictionary<String, TableSchema>(StringComparer.OrdinalIgnoreCase)
+        {
+            [leftAlias] = leftSchema,
+            [stmt.TableName!] = leftSchema
+        };
+
+        // 合并 Schema 列名列表（含表前缀）
+        var mergedColumns = new List<(String Alias, String Column, Int32 TableIndex, Int32 ColIndex)>();
+        for (var i = 0; i < leftSchema.Columns.Count; i++)
+            mergedColumns.Add((leftAlias, leftSchema.Columns[i].Name, 0, i));
+
+        // 合并行数据：当前结果集
+        var currentRows = leftRows.Select(r => r.ToArray() as Object?[]).ToList();
+
+        // 依次处理每个 JOIN
+        for (var joinIdx = 0; joinIdx < stmt.Joins!.Count; joinIdx++)
+        {
+            var join = stmt.Joins[joinIdx];
+            var rightSchema = GetSchema(join.TableName);
+            var rightTable = GetTable(join.TableName);
+            var rightAlias = join.Alias ?? join.TableName;
+            var rightRows = rightTable.GetAll(tx);
+
+            aliasSchemas[rightAlias] = rightSchema;
+            aliasSchemas[join.TableName] = rightSchema;
+
+            var rightColStart = mergedColumns.Count;
+            for (var i = 0; i < rightSchema.Columns.Count; i++)
+                mergedColumns.Add((rightAlias, rightSchema.Columns[i].Name, joinIdx + 1, i));
+
+            // Nested Loop Join
+            var joinedRows = new List<Object?[]>();
+
+            foreach (var leftRow in currentRows)
+            {
+                var matched = false;
+
+                foreach (var rightRow in rightRows)
+                {
+                    // 合并为一行
+                    var combined = new Object?[leftRow.Length + rightRow.Length];
+                    Array.Copy(leftRow, 0, combined, 0, leftRow.Length);
+                    Array.Copy(rightRow, 0, combined, leftRow.Length, rightRow.Length);
+
+                    // 在合并行上求值 ON 条件
+                    if (EvaluateJoinCondition(join.Condition, combined, mergedColumns, parameters))
+                    {
+                        joinedRows.Add(combined);
+                        matched = true;
+                    }
+                }
+
+                // LEFT JOIN：左行无匹配时补 NULL
+                if (!matched && join.Type == JoinType.Left)
+                {
+                    var combined = new Object?[leftRow.Length + rightSchema.Columns.Count];
+                    Array.Copy(leftRow, 0, combined, 0, leftRow.Length);
+                    joinedRows.Add(combined);
+                }
+            }
+
+            // RIGHT JOIN：右行无匹配时补 NULL
+            if (join.Type == JoinType.Right)
+            {
+                // rightColStart 即为左侧列总宽度（右列起始位置 = 左侧列数）
+                var leftWidth = rightColStart;
+                foreach (var rightRow in rightRows)
+                {
+                    var hasMatch = false;
+                    foreach (var leftRow in currentRows)
+                    {
+                        var combined = new Object?[leftRow.Length + rightRow.Length];
+                        Array.Copy(leftRow, 0, combined, 0, leftRow.Length);
+                        Array.Copy(rightRow, 0, combined, leftRow.Length, rightRow.Length);
+
+                        if (EvaluateJoinCondition(join.Condition, combined, mergedColumns, parameters))
+                        {
+                            hasMatch = true;
+                            break;
+                        }
+                    }
+
+                    if (!hasMatch)
+                    {
+                        var combined = new Object?[leftWidth + rightRow.Length];
+                        Array.Copy(rightRow, 0, combined, leftWidth, rightRow.Length);
+                        joinedRows.Add(combined);
+                    }
+                }
+            }
+
+            currentRows = joinedRows;
+        }
+
+        // WHERE 过滤
+        if (stmt.Where != null)
+        {
+            currentRows = currentRows.Where(row => EvaluateJoinCondition(stmt.Where, row, mergedColumns, parameters)).ToList();
+        }
+
+        // ORDER BY
+        if (stmt.OrderBy != null)
+        {
+            currentRows = ApplyJoinOrderBy(currentRows, stmt.OrderBy, mergedColumns);
+        }
+
+        // OFFSET / LIMIT
+        if (stmt.OffsetValue.HasValue)
+            currentRows = currentRows.Skip(stmt.OffsetValue.Value).ToList();
+        if (stmt.Limit.HasValue)
+            currentRows = currentRows.Take(stmt.Limit.Value).ToList();
+
+        // 投影
+        return BuildJoinSelectResult(stmt, currentRows, mergedColumns, parameters);
+    }
+
+    private SqlResult ExecuteGroupBy(SelectStatement stmt, List<Object?[]> rows, TableSchema schema, Dictionary<String, Object?>? parameters)
+    {
+        // 按 GROUP BY 列分组
+        var groups = new Dictionary<String, List<Object?[]>>();
+        foreach (var row in rows)
+        {
+            var key = BuildGroupKey(row, stmt.GroupBy!, schema);
+            if (!groups.TryGetValue(key, out var group))
+            {
+                group = [];
+                groups[key] = group;
+            }
+            group.Add(row);
+        }
+
+        // HAVING 过滤
+        var filteredGroups = groups.AsEnumerable();
+        if (stmt.Having != null)
+        {
+            filteredGroups = filteredGroups.Where(g =>
+            {
+                var representative = g.Value[0];
+                return EvaluateGroupCondition(stmt.Having, g.Value, representative, schema, parameters);
+            });
+        }
+
+        // 构建结果
+        var result = new SqlResult();
+        var colNames = BuildColumnNames(stmt, schema);
+        result.ColumnNames = colNames;
+
+        foreach (var group in filteredGroups)
+        {
+            var representative = group.Value[0];
+            var outputRow = new Object?[stmt.Columns.Count];
+
+            for (var i = 0; i < stmt.Columns.Count; i++)
+            {
+                var col = stmt.Columns[i];
+                outputRow[i] = EvaluateSelectExpression(col.Expression, group.Value, representative, schema, parameters);
+            }
+
+            result.Rows.Add(outputRow);
+        }
+
+        return result;
+    }
+
+    private SqlResult ExecuteAggregate(SelectStatement stmt, List<Object?[]> rows, TableSchema schema, Dictionary<String, Object?>? parameters)
+    {
+        var result = new SqlResult();
+        var colNames = BuildColumnNames(stmt, schema);
+        result.ColumnNames = colNames;
+
+        var outputRow = new Object?[stmt.Columns.Count];
+        for (var i = 0; i < stmt.Columns.Count; i++)
+        {
+            var col = stmt.Columns[i];
+            outputRow[i] = EvaluateSelectExpression(col.Expression, rows, rows.Count > 0 ? rows[0] : null, schema, parameters);
+        }
+
+        result.Rows.Add(outputRow);
+        return result;
+    }
+
+    private SqlResult BuildSelectResult(SelectStatement stmt, List<Object?[]> rows, TableSchema schema, Dictionary<String, Object?>? parameters)
+    {
+        var result = new SqlResult();
+
+        if (stmt.IsSelectAll)
+        {
+            result.ColumnNames = schema.Columns.Select(c => c.Name).ToArray();
+            result.Rows = rows;
+        }
+        else
+        {
+            result.ColumnNames = BuildColumnNames(stmt, schema);
+
+            foreach (var row in rows)
+            {
+                var outputRow = new Object?[stmt.Columns.Count];
+                for (var i = 0; i < stmt.Columns.Count; i++)
+                {
+                    var col = stmt.Columns[i];
+                    outputRow[i] = EvaluateExpression(col.Expression, row, schema, parameters);
+                }
+                result.Rows.Add(outputRow);
+            }
+        }
+
+        return result;
+    }
+
+    #endregion
+}

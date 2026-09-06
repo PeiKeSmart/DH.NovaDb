@@ -1,0 +1,50 @@
+﻿namespace NewLife.NovaDb.Tx;
+
+/// <summary>行版本信息（MVCC）</summary>
+public class RowVersion
+{
+    /// <summary>创建该版本的事务 ID</summary>
+    public UInt64 CreatedByTx { get; set; }
+
+    /// <summary>删除该版本的事务 ID（0 表示未删除）</summary>
+    public UInt64 DeletedByTx { get; set; }
+
+    /// <summary>主键值</summary>
+    public Object? Key { get; set; }
+
+    /// <summary>行数据负载（序列化后的列值）</summary>
+    public Byte[]? Payload { get; set; }
+
+    /// <summary>创建新的行版本</summary>
+    /// <param name="createdByTx">创建事务 ID</param>
+    /// <param name="key">主键值</param>
+    /// <param name="payload">数据负载</param>
+    public RowVersion(UInt64 createdByTx, Object? key, Byte[]? payload)
+    {
+        CreatedByTx = createdByTx;
+        DeletedByTx = 0;
+        Key = key;
+        Payload = payload;
+    }
+
+    /// <summary>检查该版本对指定事务是否可见</summary>
+    /// <param name="txManager">事务管理器</param>
+    /// <param name="readTxId">读取事务 ID</param>
+    /// <returns>是否可见</returns>
+    public Boolean IsVisible(TransactionManager txManager, UInt64 readTxId)
+    {
+        if (txManager == null)
+            throw new ArgumentNullException(nameof(txManager));
+
+        return txManager.IsVisible(CreatedByTx, DeletedByTx, readTxId);
+    }
+
+    /// <summary>
+    /// 标记为已删除
+    /// </summary>
+    /// <param name="deletedByTx">删除事务 ID</param>
+    public void MarkDeleted(UInt64 deletedByTx)
+    {
+        DeletedByTx = deletedByTx;
+    }
+}

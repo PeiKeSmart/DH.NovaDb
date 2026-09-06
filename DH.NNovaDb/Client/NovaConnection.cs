@@ -1,0 +1,223 @@
+﻿using System.Collections.Concurrent;
+using System.Data;
+using System.Data.Common;
+using NewLife.NovaDb.Core;
+using NewLife.NovaDb.Sql;
+
+namespace NewLife.NovaDb.Client;
+
+#pragma warning disable CS8765 // Nullability of parameter doesn't match overridden member
+
+/// <summary>NovaDb ADO.NET 连接。支持嵌入模式和网络模式</summary>
+public class NovaConnection : DbConnection
+{
+    #region 属性
+    private ConnectionState _state = ConnectionState.Closed;
+    private String _database = String.Empty;
+    private NovaClient? _client;
+    private SqlEngine? _sqlEngine;
+    private Boolean _fromPool;
+
+    /// <summary>嵌入模式下按数据库路径共享 SqlEngine 实例。
+    /// 同一进程内同一数据库目录的多次连接复用同一引擎，避免连接关闭时丢失内存中的表元数据。</summary>
+    private static readonly ConcurrentDictionary<String, SqlEngine> _sharedEngines = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>连接字符串设置</summary>
+    public NovaConnectionStringBuilder Setting { get; } = [];
+
+    /// <summary>连接字符串。格式：嵌入模式 "Data Source=path"，网络模式 "Server=host;Port=3306"</summary>
+    public override String ConnectionString
+    {
+        get => Setting.ConnectionString;
+        set => Setting.ConnectionString = value ?? String.Empty;
+    }
+
+    /// <summary>数据库名称</summary>
+    public override String Database => !String.IsNullOrEmpty(_database) ? _database : Setting.Database ?? String.Empty;
+
+    /// <summary>数据源</summary>
+    public override String DataSource => IsEmbedded ? Setting.DataSource ?? String.Empty : Setting.Server ?? String.Empty;
+
+    /// <summary>连接超时</summary>
+    public override Int32 ConnectionTimeout => Setting.ConnectionTimeout;
+
+    /// <summary>服务器版本</summary>
+    public override String ServerVersion => "1.0";
+
+    /// <summary>连接状态</summary>
+    public override ConnectionState State => _state;
+
+    /// <summary>是否为嵌入模式</summary>
+    public Boolean IsEmbedded => Setting.IsEmbedded;
+
+    /// <summary>远程客户端（网络模式）</summary>
+    public NovaClient? Client => _client;
+
+    /// <summary>SQL 执行引擎（嵌入模式）</summary>
+    public SqlEngine? SqlEngine => _sqlEngine;
+
+    /// <summary>SQL 会话事务。由 BEGIN/COMMIT/ROLLBACK 语句管理（嵌入模式）</summary>
+    /// <remarks>连接级事务上下文，SQL 语句 BEGIN 开启后存入，COMMIT/ROLLBACK 结束清空</remarks>
+    public Tx.Transaction? SessionTransaction { get; set; }
+
+    /// <summary>客户端工厂</summary>
+    public NovaClientFactory Factory { get; set; } = NovaClientFactory.Instance;
+
+    /// <summary>提供者工厂</summary>
+    protected override DbProviderFactory DbProviderFactory => Factory;
+    #endregion
+
+    #region 构造
+    /// <summary>实例化</summary>
+    public NovaConnection() { }
+
+    /// <summary>使用连接字符串实例化</summary>
+    /// <param name="connectionString">连接字符串</param>
+    public NovaConnection(String connectionString) => ConnectionString = connectionString;
+    #endregion
+
+    #region 打开关闭
+    /// <summary>打开连接</summary>
+    public override void Open()
+    {
+        if (_state == ConnectionState.Open) return;
+
+        _state = ConnectionState.Connecting;
+
+        if (IsEmbedded)
+        {
+            var dataSource = Setting.DataSource;
+            if (!dataSource.IsNullOrEmpty())
+            {
+                // 共享 SqlEngine：同一进程内同一数据库路径只创建一次，避免连接关闭时丢失表元数据
+                var key = Path.GetFullPath(dataSource);
+                _sqlEngine = _sharedEngines.GetOrAdd(key, p =>
+                {
+                    var options = new DbOptions
+                    {
+                        Path = p,
+                        WalMode = Setting.WalMode,
+                        ReadOnly = Setting.ReadOnly
+                    };
+                    return new SqlEngine(p, options);
+                });
+            }
+        }
+        else
+        {
+            // 从连接池获取客户端
+            var pool = Factory.PoolManager.GetPool(Setting);
+            _client = pool.Get();
+            _fromPool = true;
+        }
+
+        _state = ConnectionState.Open;
+    }
+
+    /// <summary>关闭连接</summary>
+    public override void Close()
+    {
+        if (_state == ConnectionState.Closed) return;
+
+        // 如果客户端来自连接池，归还而非关闭
+        if (_fromPool && _client != null)
+        {
+            var pool = Factory.PoolManager.GetPool(Setting);
+            pool.Return(_client);
+            _client = null;
+            _fromPool = false;
+        }
+        else
+        {
+            _client?.Close("Connection.Close");
+            _client = null;
+        }
+
+        // 共享 SqlEngine 不在连接关闭时释放，由进程生命周期或显式调用 DisposeSharedEngines 管理
+        _sqlEngine = null;
+
+        _state = ConnectionState.Closed;
+    }
+    #endregion
+
+    #region 方法
+    /// <summary>切换数据库</summary>
+    /// <param name="databaseName">数据库名称</param>
+    public override void ChangeDatabase(String databaseName) => _database = databaseName;
+
+    /// <summary>开始事务</summary>
+    /// <param name="isolationLevel">隔离级别</param>
+    /// <returns>事务实例</returns>
+    protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) => new NovaTransaction(this);
+
+    /// <summary>创建命令</summary>
+    /// <returns>命令实例</returns>
+    protected override DbCommand CreateDbCommand() => new NovaCommand { Connection = this };
+
+    /// <summary>执行 SQL 语句</summary>
+    /// <param name="sql">SQL 语句</param>
+    /// <returns>受影响行数</returns>
+    public Int32 ExecuteNonQuery(String sql)
+    {
+        using var cmd = CreateCommand();
+        cmd.CommandText = sql;
+        return cmd.ExecuteNonQuery();
+    }
+    #endregion
+
+    #region 架构信息
+    /// <summary>获取架构信息</summary>
+    public override DataTable GetSchema() => GetSchema(null, null);
+
+    /// <summary>获取架构信息</summary>
+    public override DataTable GetSchema(String collectionName) => GetSchema(collectionName, null);
+
+    private SchemaProvider? _schemaProvider;
+    /// <summary>获取架构信息</summary>
+    public override DataTable GetSchema(String? collectionName, String?[]? restrictionValues)
+    {
+        var provider = _schemaProvider ??= new SchemaProvider(this);
+        return provider.GetSchema(collectionName, restrictionValues).AsDataTable();
+    }
+    #endregion
+
+    #region 释放
+    /// <summary>释放资源</summary>
+    /// <param name="disposing">是否由 Dispose 调用</param>
+    protected override void Dispose(Boolean disposing)
+    {
+        base.Dispose(disposing);
+
+        // 如果客户端来自连接池，归还而非销毁
+        if (_fromPool && _client != null)
+        {
+            var pool = Factory.PoolManager.GetPool(Setting);
+            pool.Return(_client);
+            _client = null;
+            _fromPool = false;
+        }
+        else
+        {
+            _client?.Close(disposing ? "Dispose" : "GC");
+            _client?.Dispose();
+            _client = null;
+        }
+
+        // 共享 SqlEngine 不随连接销毁
+        _sqlEngine = null;
+    }
+
+    /// <summary>释放所有共享的嵌入式 SqlEngine。通常在进程退出前调用，确保元数据与文件正确释放</summary>
+    public static void DisposeSharedEngines()
+    {
+        foreach (var kv in _sharedEngines.ToArray())
+        {
+            if (_sharedEngines.TryRemove(kv.Key, out var engine))
+            {
+                try { engine.Dispose(); }
+                catch { }
+            }
+        }
+    }
+    #endregion
+}

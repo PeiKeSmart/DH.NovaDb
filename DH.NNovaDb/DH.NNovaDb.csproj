@@ -1,14 +1,14 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+    <TargetFrameworks>net45;net461;netstandard2.0;netstandard2.1;net6.0;net8.0;net10.0</TargetFrameworks>
     <OutputType>Library</OutputType>
-    <RootNamespace>DH.Grpc</RootNamespace>
-    <AssemblyName>DH.Grpc</AssemblyName>
-    <AssemblyTitle>Grpc扩展类</AssemblyTitle>
-    <Description>DH框架Grpc扩展类</Description>
+    <RootNamespace>DH.NNovaDb</RootNamespace>
+    <AssemblyName>DH.NNovaDb</AssemblyName>
+    <AssemblyTitle>DH.NNovaDb 混合数据库</AssemblyTitle>
+    <Description>以 C# 实现、运行于 .NET 平台的中大型混合数据库基础设施：嵌入/服务双模，融合关系型、时序、消息队列、NoSQL(KV) 能力；通过裁剪冷门特性提升读写性能。</Description>
     <Company>湖北登灏科技有限公司</Company>
-    <Copyright>©2020-2025 湖北登灏科技有限公司</Copyright>
-    <VersionPrefix>4.16</VersionPrefix>
+    <Copyright>©2020-2026 湖北登灏科技有限公司</Copyright>
+    <VersionPrefix>4.25</VersionPrefix>
     <VersionSuffix>$([System.DateTime]::Now.ToString(`yyyy.MMdd`))</VersionSuffix>
     <Version>$(VersionPrefix).$(VersionSuffix)</Version>
     <FileVersion>$(Version)</FileVersion>
@@ -31,8 +31,8 @@
     <PackageIcon>DH.png</PackageIcon>
     <RepositoryUrl>https://github.com/PeiKeSmart/Pek.Common</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>湖北登灏科技有限公司;DH组件;DH;$(AssemblyName)</PackageTags>
-    <PackageReleaseNotes></PackageReleaseNotes>
+    <PackageTags>NovaDb;Database;SQL;TimeSeries;MessageQueue;KV;Embedded;Server;湖北登灏科技有限公司;DH组件;DH;$(AssemblyName)</PackageTags>
+    <PackageReleaseNotes>以 C# 实现、运行于 .NET 平台的混合数据库，嵌入/服务双模；融合关系型、时序、消息队列、KV 四大引擎；支持 SQL 子集、JOIN、事务 MVCC、WAL 崩溃恢复；新增 GeoPoint 地理与 Vector 向量类型、全文检索（BM25）、NovaVectorStore 多集合架构；Binlog 主从复制与故障切换、XCode ORM 全链路适配；千万行级表热冷索引分离查询仅用 &lt;20MB 内存</PackageReleaseNotes>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
@@ -44,13 +44,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="DH.NCore" Version="4.25.2026.906-beta0249" />
+    <PackageReference Include="DH.NRemoting" Version="4.25.2026.828-beta0929" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="10.0.103">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
-    <PackageReference Include="Grpc.AspNetCore.Server" Version="2.76.0" />
-    <PackageReference Include="Grpc.AspNetCore.Web" Version="2.76.0" />
-    <PackageReference Include="Pek.AspNetCore" Version="4.18.2026.305-beta0952" />
   </ItemGroup>
 
   <ItemGroup>
@@ -61,6 +60,10 @@
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
     </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Client\ReservedWords.txt" />
   </ItemGroup>
 
 </Project>
