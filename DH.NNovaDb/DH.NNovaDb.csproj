@@ -23,6 +23,10 @@
     <WarningsAsErrors>CA2007</WarningsAsErrors>
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="XUnitTest" />
+  </ItemGroup>
+
   <PropertyGroup>
     <IsPackable>true</IsPackable>
     <PackageId>$(AssemblyName)</PackageId>
