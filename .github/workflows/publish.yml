@@ -24,7 +24,7 @@ jobs:
         dotnet restore DH.Grpc/DH.Grpc.csproj
     - name: Build
       run: |
-        dotnet pack --no-restore --version-suffix $(date "+%Y.%m%d") -c Release -o out DH.Grpc/DH.Grpc.csproj
+        dotnet pack --no-restore --version-suffix $(date "+%Y.%m%d") -c Release -o out DH.NNovaDb/DH.NNovaDb.csproj
     - name: Publish
       run: |
         dotnet nuget push ./out/*.nupkg --skip-duplicate --source https://api.nuget.org/v3/index.json --api-key ${{ secrets.nugetKey }}
